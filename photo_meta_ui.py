@@ -4,7 +4,7 @@ from collections import Counter
 import math
 import re
 
-# ==== 读取/等效换算（与 focal_stats_jpg.py 同目录）====
+# ==== 与 focal_stats_jpg.py 同目录 ====
 try:
     from focal_stats_jpg import gather_rows, estimate_35mm  # noqa
 except Exception as e:
@@ -14,17 +14,16 @@ except Exception as e:
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFileDialog, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QLineEdit, QComboBox, QListWidget, QListWidgetItem,
-    QAbstractItemView, QCheckBox, QMessageBox, QDoubleSpinBox, QTableWidget, QTableWidgetItem,
-    QScrollArea, QSizePolicy
+    QAbstractItemView, QCheckBox, QMessageBox, QDoubleSpinBox, QSpinBox,
+    QTableWidget, QTableWidgetItem, QScrollArea, QSizePolicy, QProgressBar
 )
-from PySide6.QtCore import Qt, QSize
+from PySide6.QtCore import Qt, QSize, QObject, QThread, Signal
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
 
-# ---------- 辅助 ----------
+# ---------- 工具函数 ----------
 def parse_shutter_to_stops(exposure_str):
-    """把 '1/250' '0.005' '2' 等转为 (秒, EV)，EV=log2(1/t)。"""
     if exposure_str is None:
         return None, None
     s = str(exposure_str).strip()
@@ -82,11 +81,6 @@ def build_dataframe_like(rows):
 
 
 def histogram(values, bin_width, mode):
-    """
-    - focal: 按 mm 线性分箱
-    - shutter: 按 EV 线性分箱（0.33、0.5、1.0…）
-    - iso: 按 ISO 数值分箱
-    """
     if not values:
         return {}
     bw = max(1e-6, float(bin_width))
@@ -95,7 +89,51 @@ def histogram(values, bin_width, mode):
     return dict(sorted(c.items(), key=lambda kv: kv[0]))
 
 
-# ---------- 画布 ----------
+# ---- 解析镜头名得到焦段范围（mm）----
+_lens_range_cache = {}
+
+def parse_lens_focal_range(lens_name: str):
+    if not lens_name:
+        return None
+    key = lens_name.strip()
+    if key in _lens_range_cache:
+        return _lens_range_cache[key]
+    s = lens_name.replace(" ", "")
+    m = re.search(r'(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*mm', lens_name, re.IGNORECASE)
+    if not m:
+        m = re.search(r'(\d+(?:\.\d+)?)-?(\d+(?:\.\d+)?)mm', s, re.IGNORECASE)
+    if m:
+        v1 = float(m.group(1)); v2 = float(m.group(2))
+        lo, hi = (v1, v2) if v1 <= v2 else (v2, v1)
+        _lens_range_cache[key] = (lo, hi, False)
+        return _lens_range_cache[key]
+    m = re.search(r'(\d+(?:\.\d+)?)\s*mm', lens_name, re.IGNORECASE)
+    if not m:
+        m = re.search(r'(\d+(?:\.\d+)?)mm', s, re.IGNORECASE)
+    if m:
+        v = float(m.group(1))
+        _lens_range_cache[key] = (v, v, True)
+        return _lens_range_cache[key]
+    _lens_range_cache[key] = None
+    return None
+
+
+def in_physical_range(focal_mm, lens_name, tol_percent=5.0, tol_abs_mm=2.0):
+    if focal_mm is None:
+        return True
+    rng = parse_lens_focal_range(lens_name or "")
+    if not rng:
+        return True
+    lo, hi, is_prime = rng
+    if is_prime:
+        delta = max(tol_abs_mm, lo * (tol_percent / 100.0))
+        return (lo - delta) <= focal_mm <= (hi + delta)
+    else:
+        delta = max(tol_abs_mm, max(lo, hi) * (tol_percent / 100.0))
+        return (lo - delta) <= focal_mm <= (hi + delta)
+
+
+# ---------- Matplotlib 画布 ----------
 class MplCanvas(FigureCanvas):
     def __init__(self, parent=None):
         self.fig = Figure(figsize=(6, 4), dpi=100, constrained_layout=True)
@@ -120,8 +158,6 @@ class MplCanvas(FigureCanvas):
             self.ax.bar(pos, counts, width=0.8, align='center')
             self.ax.set_xticks(pos)
             self.ax.set_xticklabels(xs, rotation=45)
-
-        # 图内仍用英文
         self.ax.set_title(title, fontweight="bold")
         self.ax.set_xlabel(xlabel)
         self.ax.set_ylabel("Count")
@@ -129,25 +165,43 @@ class MplCanvas(FigureCanvas):
         self.draw()
 
 
+# ---------- 读取线程 ----------
+class ReaderWorker(QObject):
+    finished = Signal(object, str)   # data(list_of_dict) or None, error_message
+    def __init__(self, folder: Path):
+        super().__init__()
+        self.folder = folder
+
+    def run(self):
+        try:
+            rows = gather_rows(self.folder, use_exiftool=True)  # 阻塞但在子线程
+            data = build_dataframe_like(rows)
+            self.finished.emit(data, "")
+        except Exception as e:
+            self.finished.emit(None, str(e))
+
+
 # ---------- 主窗 ----------
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Photo Meta Analyzer")
-        self.setMinimumSize(QSize(1120, 700))
+        self.setMinimumSize(QSize(1120, 720))
 
         # 数据
-        self.rows = []
         self.data = []
         self.current_folder = None
         self._last_plot = None  # 保存复合图时使用
 
-        # 顶部条
+        # 顶部条 + 进度条
         self.ed_path = QLineEdit()
         self.btn_browse = QPushButton("选择文件夹")
         self.btn_read = QPushButton("读取")
         self.lbl_status = QLabel("状态：未读取")
         self.lbl_status.setStyleSheet("color:#555;")
+        self.progress = QProgressBar()
+        self.progress.setVisible(False)   # 读取时显示
+        self.progress.setFixedWidth(180)
 
         top_layout = QHBoxLayout()
         top_layout.addWidget(QLabel("文件夹："))
@@ -155,6 +209,7 @@ class MainWindow(QMainWindow):
         top_layout.addWidget(self.btn_browse)
         top_layout.addWidget(self.btn_read)
         top_layout.addWidget(self.lbl_status)
+        top_layout.addWidget(self.progress)
 
         # ===== 三列：左=参数  中=相机  右=镜头 =====
         self.cmb_analysis = QComboBox()
@@ -172,6 +227,18 @@ class MainWindow(QMainWindow):
         self.spn_dpi.setValue(150)
         self.spn_dpi.setDecimals(0)
 
+        # 合理性筛选
+        self.chk_sanity = QCheckBox("启用物理合理性筛选（按镜头标称焦段）")
+        self.spn_tol_pct = QSpinBox()
+        self.spn_tol_pct.setRange(0, 50)
+        self.spn_tol_pct.setValue(5)
+        self.spn_tol_pct.setSuffix(" %")
+        self.spn_tol_abs = QDoubleSpinBox()
+        self.spn_tol_abs.setRange(0.0, 20.0)
+        self.spn_tol_abs.setDecimals(1)
+        self.spn_tol_abs.setValue(2.0)
+        self.spn_tol_abs.setSuffix(" mm")
+
         self.chk_autosave = QCheckBox("更新时自动保存PNG（复合图）")
         self.btn_save_png = QPushButton("另存当前复合图")
 
@@ -187,6 +254,15 @@ class MainWindow(QMainWindow):
         left.addWidget(self.spn_bin)
         left.addWidget(QLabel("图像DPI"))
         left.addWidget(self.spn_dpi)
+        left.addWidget(QLabel("合理性筛选"))
+        row_tol = QHBoxLayout()
+        row_tol.addWidget(self.chk_sanity)
+        left.addLayout(row_tol)
+        row_tol2 = QHBoxLayout()
+        row_tol2.addWidget(QLabel("容差："))
+        row_tol2.addWidget(self.spn_tol_pct)
+        row_tol2.addWidget(self.spn_tol_abs)
+        left.addLayout(row_tol2)
         left.addWidget(self.chk_autosave)
         left.addWidget(self.btn_save_png)
         left.addWidget(QLabel("裁切系数（可编辑）"))
@@ -242,7 +318,7 @@ class MainWindow(QMainWindow):
 
         # 信号
         self.btn_browse.clicked.connect(self.on_browse)
-        self.btn_read.clicked.connect(self.on_read)
+        self.btn_read.clicked.connect(self.on_read_clicked)
         self.cmb_analysis.currentIndexChanged.connect(self.on_mode_changed)
         self.cmb_analysis.currentIndexChanged.connect(self.update_plot)
         self.lst_camera.itemSelectionChanged.connect(self.update_plot)
@@ -251,9 +327,15 @@ class MainWindow(QMainWindow):
         self.btn_apply_crop.clicked.connect(self.update_plot)
         self.spn_bin.valueChanged.connect(self.update_plot)
         self.spn_dpi.valueChanged.connect(self.update_plot)
+        self.chk_sanity.stateChanged.connect(self.update_plot)
+        self.spn_tol_pct.valueChanged.connect(self.update_plot)
+        self.spn_tol_abs.valueChanged.connect(self.update_plot)
 
-        # 初始根据模式设置分箱控件
         self.on_mode_changed()
+
+        # 线程句柄
+        self._thread = None
+        self._worker = None
 
     # ---- 事件 ----
     def on_browse(self):
@@ -261,7 +343,8 @@ class MainWindow(QMainWindow):
         if d:
             self.ed_path.setText(d)
 
-    def on_read(self):
+    # —— 点击读取：启动子线程，UI 不阻塞
+    def on_read_clicked(self):
         folder = self.ed_path.text().strip()
         if not folder:
             QMessageBox.warning(self, "提示", "请先选择文件夹。")
@@ -270,55 +353,79 @@ class MainWindow(QMainWindow):
         if not p.exists():
             QMessageBox.critical(self, "错误", "路径不存在。")
             return
-        self.lbl_status.setText("状态：读取中…")
-        QApplication.processEvents()
 
-        try:
-            self.rows = gather_rows(p, use_exiftool=True)
-            if not self.rows:
-                self.lbl_status.setText("状态：未找到 JPG/EXIF")
-                return
-            self.data = build_dataframe_like(self.rows)
-            self.current_folder = p
-            self.fill_filters()
-            self.fill_crop_table()
-            self.cmb_analysis.setCurrentIndex(0)
-            self.on_mode_changed()
-            self.update_plot()
-            self.lbl_status.setText(f"状态：已更新（{len(self.data)} 条）")
-        except Exception as e:
+        # 禁用控件 & 显示不确定进度条
+        self.setControlsEnabled(False)
+        self.progress.setVisible(True)
+        self.progress.setRange(0, 0)  # 不确定模式
+        self.lbl_status.setText("状态：读取中…")
+
+        # 启动线程
+        self._thread = QThread()
+        self._worker = ReaderWorker(p)
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.finished.connect(self._on_read_finished)
+        self._worker.finished.connect(self._thread.quit)
+        self._worker.finished.connect(self._worker.deleteLater)
+        self._thread.finished.connect(self._thread.deleteLater)
+        self._thread.start()
+
+    def _on_read_finished(self, data, err):
+        # 线程回调在主线程执行
+        if err:
+            QMessageBox.critical(self, "错误", f"读取失败：\n{err}")
             self.lbl_status.setText("状态：读取失败")
-            QMessageBox.critical(self, "错误", f"读取失败：\n{e}")
+            self.progress.setVisible(False)
+            self.setControlsEnabled(True)
+            return
+
+        self.data = data or []
+        if not self.data:
+            self.lbl_status.setText("状态：未找到 JPG/EXIF")
+            self.progress.setVisible(False)
+            self.setControlsEnabled(True)
+            return
+
+        self.fill_filters()
+        self.fill_crop_table()
+        self.cmb_analysis.setCurrentIndex(0)
+        self.on_mode_changed()
+        self.update_plot()
+        self.lbl_status.setText(f"状态：已更新（{len(self.data)} 条）")
+
+        # 恢复控件 & 关闭进度条
+        self.progress.setVisible(False)
+        self.setControlsEnabled(True)
+
+    def setControlsEnabled(self, enabled: bool):
+        for w in [
+            self.btn_browse, self.btn_read, self.cmb_analysis, self.spn_bin, self.spn_dpi,
+            self.chk_sanity, self.spn_tol_pct, self.spn_tol_abs,
+            self.chk_autosave, self.btn_save_png, self.tbl_crop, self.btn_apply_crop,
+            self.lst_camera, self.lst_lens
+        ]:
+            w.setEnabled(enabled)
 
     def fill_filters(self):
         cams = sorted({d["model"] for d in self.data if d.get("model")})
         lens = sorted({d["lens"] for d in self.data if d.get("lens")})
-
         self.lst_camera.clear()
         for c in cams:
-            it = QListWidgetItem(c)
-            self.lst_camera.addItem(it)
-            it.setSelected(True)
-
+            it = QListWidgetItem(c); self.lst_camera.addItem(it); it.setSelected(True)
         self.lst_lens.clear()
         for l in lens:
-            it = QListWidgetItem(l)
-            self.lst_lens.addItem(it)
-            it.setSelected(True)
+            it = QListWidgetItem(l); self.lst_lens.addItem(it); it.setSelected(True)
 
     def fill_crop_table(self):
         cams = sorted({d["model"] for d in self.data if d.get("model")})
         self.tbl_crop.setRowCount(len(cams))
         for i, cam in enumerate(cams):
             self.tbl_crop.setItem(i, 0, QTableWidgetItem(str(cam)))
-            s = (cam or "").upper()
-            cf = 1.0
-            if any(k in s for k in ["ILCE-6", "A6", "X-T", "X-S", "X-H", "ZV-E", "ALPHA 6"]):
-                cf = 1.5
-            if "EOS R" in s and any(k in s for k in ["R7", "R10", "R50"]):
-                cf = 1.6
-            if any(k in s for k in ["OM-", "E-M", "DMC-G", "DC-G", "GH", "GX"]):
-                cf = 2.0
+            s = (cam or "").upper(); cf = 1.0
+            if any(k in s for k in ["ILCE-6", "A6", "X-T", "X-S", "X-H", "ZV-E", "ALPHA 6"]): cf = 1.5
+            if "EOS R" in s and any(k in s for k in ["R7", "R10", "R50"]): cf = 1.6
+            if any(k in s for k in ["OM-", "E-M", "DMC-G", "DC-G", "GH", "GX"]): cf = 2.0
             self.tbl_crop.setItem(i, 1, QTableWidgetItem(str(cf)))
 
     def read_crop_table(self):
@@ -337,34 +444,27 @@ class MainWindow(QMainWindow):
                 d[cam] = cf
         return d
 
-    # ---- 模式切换时动态调整分箱控件 ----
     def on_mode_changed(self):
         idx = self.cmb_analysis.currentIndex()
         if idx in (0, 1):  # 焦距（等效/物理）
             self.spn_bin.blockSignals(True)
-            self.spn_bin.setDecimals(0)
-            self.spn_bin.setRange(1, 200)
+            self.spn_bin.setDecimals(0); self.spn_bin.setRange(1, 200)
             self.spn_bin.setSingleStep(1)
-            if self.spn_bin.value() < 1:
-                self.spn_bin.setValue(5)
+            if self.spn_bin.value() < 1: self.spn_bin.setValue(5)
             self.spn_bin.setSuffix(" mm")
             self.spn_bin.blockSignals(False)
         elif idx == 2:  # 快门（EV）
             self.spn_bin.blockSignals(True)
-            self.spn_bin.setDecimals(2)
-            self.spn_bin.setRange(0.01, 10.0)
-            self.spn_bin.setSingleStep(0.33)  # 常用 1/3 EV
-            if self.spn_bin.value() < 0.01 or self.spn_bin.value() > 10:
-                self.spn_bin.setValue(1.00)
+            self.spn_bin.setDecimals(2); self.spn_bin.setRange(0.01, 10.0)
+            self.spn_bin.setSingleStep(0.33)
+            if self.spn_bin.value() < 0.01 or self.spn_bin.value() > 10: self.spn_bin.setValue(1.00)
             self.spn_bin.setSuffix(" EV")
             self.spn_bin.blockSignals(False)
         else:  # ISO
             self.spn_bin.blockSignals(True)
-            self.spn_bin.setDecimals(0)
-            self.spn_bin.setRange(10, 2000)
+            self.spn_bin.setDecimals(0); self.spn_bin.setRange(10, 2000)
             self.spn_bin.setSingleStep(10)
-            if self.spn_bin.value() < 10:
-                self.spn_bin.setValue(100)
+            if self.spn_bin.value() < 10: self.spn_bin.setValue(100)
             self.spn_bin.setSuffix(" ISO")
             self.spn_bin.blockSignals(False)
 
@@ -375,7 +475,7 @@ class MainWindow(QMainWindow):
             if len(items) <= n:
                 return ", ".join(items)
             return ", ".join(items[:n]) + f" … (total {len(items)})"
-        return f"相机: {summarise(cams)}\n\n镜头: {summarise(lens)}"
+        return f"Camera: {summarise(cams)}\n\nLens: {summarise(lens)}"
 
     def save_png(self):
         if not self.data or not self._last_plot:
@@ -387,13 +487,11 @@ class MainWindow(QMainWindow):
             self.lbl_status.setText("状态：已保存 → " + Path(path).name)
 
     def _save_composite(self, path, dpi=150):
-        """左图右文复合保存。"""
         lp = self._last_plot
         fig = Figure(figsize=(8, 4.5), dpi=dpi, constrained_layout=True)
         gs = fig.add_gridspec(ncols=2, nrows=1, width_ratios=[3.0, 1.3])
         ax = fig.add_subplot(gs[0, 0])
         ax2 = fig.add_subplot(gs[0, 1])
-        # 左
         if lp["numeric"]:
             xs = lp["xs"]; ys = lp["ys"]; bw = lp["bar_width"]
             ax.bar(xs, ys, width=bw, align='center')
@@ -404,7 +502,6 @@ class MainWindow(QMainWindow):
             ax.set_xticks(pos); ax.set_xticklabels(lp["xs"], rotation=45)
         ax.set_title(lp["title"], fontweight="bold")
         ax.set_xlabel(lp["xlabel"]); ax.set_ylabel("Count"); ax.margins(x=0.02, y=0.05)
-        # 右
         ax2.axis("off")
         txt = self._sel_summary_text(lp["cams"], lp["lens"])
         ax2.text(0.02, 0.98, "Selection summary", fontsize=11, weight="bold", va="top")
@@ -414,7 +511,6 @@ class MainWindow(QMainWindow):
     def update_plot(self):
         if not self.data:
             return
-
         dpi = int(self.spn_dpi.value())
         self.canvas.fig.set_dpi(dpi)
 
@@ -425,13 +521,23 @@ class MainWindow(QMainWindow):
         bin_w = float(self.spn_bin.value())
         crop_override = self.read_crop_table()
 
-        # 过滤
+        # 过滤 + 合理性筛选
+        use_sanity = self.chk_sanity.isChecked()
+        tol_pct = float(self.spn_tol_pct.value())
+        tol_abs = float(self.spn_tol_abs.value())
+
         filt = []
+        removed_by_sanity = 0
         for d in self.data:
             if keep_cams_set and d.get("model") and d["model"] not in keep_cams_set:
                 continue
             if keep_lens_set and d.get("lens") and d["lens"] not in keep_lens_set:
                 continue
+            if use_sanity:
+                if not in_physical_range(d.get("focal_mm"), d.get("lens"),
+                                         tol_percent=tol_pct, tol_abs_mm=tol_abs):
+                    removed_by_sanity += 1
+                    continue
             filt.append(d)
 
         self.sel_label.setText(self._sel_summary_text(keep_cams, keep_lens))
@@ -441,7 +547,6 @@ class MainWindow(QMainWindow):
             self.lbl_status.setText("状态：筛选后无数据")
             return
 
-        # 分布 + 绘图（图内英文）
         if mode_idx == 0:  # 35mm等效
             def focal35_with_override(x):
                 mm = x.get("focal_mm"); model = x.get("model")
@@ -469,7 +574,7 @@ class MainWindow(QMainWindow):
             self._last_plot = dict(xs=xs, ys=ys, title=title, xlabel=xlabel,
                                    numeric=True, bar_width=bin_w*0.9, cams=keep_cams, lens=keep_lens)
 
-        elif mode_idx == 2:  # 快门（EV 空间）
+        elif mode_idx == 2:  # 快门（EV）
             vals = [x["shutter_stops"] for x in filt if x.get("shutter_stops") is not None]
             dist = histogram(vals, bin_width=max(0.01, bin_w), mode="shutter")
             xs_ev = list(dist.keys()); ys = list(dist.values())
@@ -498,10 +603,11 @@ class MainWindow(QMainWindow):
                                    xlabel="ISO", numeric=True, bar_width=max(10.0, bin_w)*0.9,
                                    cams=keep_cams, lens=keep_lens)
 
+        # 状态
         if self.chk_autosave.isChecked() and self._last_plot:
             out = Path.cwd() / "hist.png"
             self._save_composite(out, dpi=int(self.spn_dpi.value()))
-            self.lbl_status.setText("状态：已保存 → hist.png")
+            self.lbl_status.setText(f"状态：已保存 → hist.png")
         else:
             self.lbl_status.setText(f"状态：已更新（{len(filt)} 条）")
 
@@ -510,5 +616,4 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
     w = MainWindow()
     w.show()
-
     sys.exit(app.exec())
