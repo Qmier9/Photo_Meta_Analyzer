@@ -19,6 +19,12 @@
 ```bash
 # 建议 Python 3.10+
 pip install -r requirements.txt
+```
+
+##🚀 运行
+```bash
+python photo_meta_ui.py
+```
 
 程序截图
 <img width="1115" height="837" alt="image" src="https://github.com/user-attachments/assets/697588b8-212c-44e2-8a2b-b2a355e66197" />
